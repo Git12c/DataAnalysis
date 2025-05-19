@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Data Analysis API Interface</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+</head>
+<body class="bg-light">
+<div class="container mt-5">
+    <h1 class="mb-4">Data Analysis API Interface</h1>
+    <form action="/select" method="post" class="mb-4">
+        <div class="row">
+            <div class="col-md-4 mb-3">
+                <label for="product_id" class="form-label">Select Product ID</label>
+                <select class="form-select" id="product_id" name="product_id">
+                    {% for pid in products %}
+                        <option value="{{ pid }}" {% if selected_product == pid %}selected{% endif %}>{{ pid }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-4 mb-3">
+                <label for="branch" class="form-label">Select Branch</label>
+                <select class="form-select" id="branch" name="branch">
+                    {% for b in branches %}
+                        <option value="{{ b }}" {% if selected_branch == b %}selected{% endif %}>{{ b }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-4 mb-3 d-flex align-items-end">
+                <button class="btn btn-primary w-100" type="submit">Update Model</button>
+            </div>
+        </div>
+    </form>
+    <div class="mb-4">
+        <a href="/prophet/plot" class="btn btn-success">Show Prophet Forecast Plot</a>
+        <a href="/prophet/components" class="btn btn-info">Show Prophet Components</a>
+        <a href="/data-table" class="btn btn-secondary">Show Data Table</a>
+    </div>
+    {% if plot_url %}
+    <img src="{{ plot_url }}" class="img-fluid" alt="Data Plot">
+    {% endif %}
+    {% if table_html %}
+    <div class="table-responsive">{{ table_html|safe }}</div>
+    {% endif %}
+    {% if upload_message %}
+    <div class="alert alert-info">{{ upload_message }}</div>
+    {% endif %}
+</div>
+</body>
+</html>

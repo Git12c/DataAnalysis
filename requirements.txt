@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pandas
+matplotlib
+prophet
+jinja2
+aiofiles
