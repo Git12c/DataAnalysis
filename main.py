@@ -1,4 +1,6 @@
 import os
+import matplotlib
+matplotlib.use('Agg')
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -15,6 +17,8 @@ from preprocessing import preprocess_for_prophet
 from prophet_model import train_and_forecast, save_prophet_plots
 from dotenv import load_dotenv
 import requests
+from agentic_genai import run_sales_insight_agent
+import asyncio
 
 app = FastAPI()
 
@@ -92,43 +96,41 @@ def api_prophet_forecast():
 
 @app.get("/prophet/plot", response_class=HTMLResponse)
 def prophet_plot(request: Request):
-    # Serve the pre-generated forecast plot image if Prophet model is not available
-    import os
-    static_path = os.path.join("static", "prophet_forecast.png")
-    if os.path.exists(static_path):
-        plot_url = "/static/prophet_forecast.png"
-        return templates.TemplateResponse("index.html", {"request": request, "plot_url": plot_url})
-    # fallback to old logic
     global prophet_model, forecast_df
     if prophet_model is None or forecast_df is None:
-        return templates.TemplateResponse("index.html", {"request": request, "upload_message": "No forecast available."})
+        return HTMLResponse("<div class='alert alert-warning'>No forecast available.</div>")
     fig = prophet_model.plot(forecast_df)
     buf = io.BytesIO()
     fig.savefig(buf, format='png')
     buf.seek(0)
-    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-    plot_url = f"data:image/png;base64,{img_base64}"
-    return templates.TemplateResponse("index.html", {"request": request, "plot_url": plot_url})
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    img_src = f"data:image/png;base64,{img_base64}"
+    return templates.TemplateResponse("plain.html", {"request": request, "img_src": img_src})
 
 @app.get("/prophet/components", response_class=HTMLResponse)
 def prophet_components(request: Request):
-    # Serve the pre-generated components plot image if Prophet model is not available
-    import os
-    static_path = os.path.join("static", "prophet_components.png")
-    if os.path.exists(static_path):
-        plot_url = "/static/prophet_components.png"
-        return templates.TemplateResponse("index.html", {"request": request, "plot_url": plot_url})
-    # fallback to old logic
     global prophet_model, forecast_df
     if prophet_model is None or forecast_df is None:
-        return templates.TemplateResponse("index.html", {"request": request, "upload_message": "No forecast available."})
+        return HTMLResponse("<div class='alert alert-warning'>No forecast available.</div>")
     fig = prophet_model.plot_components(forecast_df)
     buf = io.BytesIO()
     fig.savefig(buf, format='png')
     buf.seek(0)
-    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-    plot_url = f"data:image/png;base64,{img_base64}"
-    return templates.TemplateResponse("index.html", {"request": request, "plot_url": plot_url})
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    img_src = f"data:image/png;base64,{img_base64}"
+    return templates.TemplateResponse("plain.html", {"request": request, "img_src": img_src})
+
+@app.get("/prophet/forecast-plot")
+def prophet_forecast_plot():
+    global prophet_model, forecast_df
+    if prophet_model is None or forecast_df is None:
+        return JSONResponse(content={"error": "No forecast available"}, status_code=404)
+    fig = prophet_model.plot(forecast_df)
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    return JSONResponse(content={"image_base64": img_base64})
 
 @app.get("/data-table", response_class=HTMLResponse)
 def data_table(request: Request):
@@ -308,25 +310,9 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 AUTOGEN_API_KEY = os.getenv("AUTOGEN_API_KEY")
 
-# Helper to call Gemini 1.5 Flash for GenAI insights
-def get_genai_insights(prompt: str) -> str:
-    if not GEMINI_API_KEY:
-        return "<div class='alert alert-warning'>GEMINI_API_KEY not set in .env</div>"
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + GEMINI_API_KEY
-    headers = {"Content-Type": "application/json"}
-    data = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 512}
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=data, timeout=30)
-        resp.raise_for_status()
-        result = resp.json()
-        # Extract HTML from the response
-        html = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        return html
-    except Exception as e:
-        return f"<div class='alert alert-danger'>GenAI error: {str(e)}</div>"
+# Helper to call Gemini 1.5 Flash for GenAI insights using agentic approach
+async def get_genai_insights_agentic(prompt: str) -> str:
+    return await run_sales_insight_agent(prompt)
 
 @app.get("/genai/insights", response_class=HTMLResponse)
 def genai_insights(request: Request):
@@ -358,33 +344,29 @@ def genai_insights(request: Request):
         branch_summary.append({'Branch': branch, 'TotalSales': total_sales, 'RegionalManager': regional_manager, 'SalesHead': sales_head})
     branch_summary = [b for b in branch_summary if b['RegionalManager'] and b['SalesHead']]
     branch_summary = sorted(branch_summary, key=lambda x: x['TotalSales'], reverse=True)
-    best_branch = branch_summary[0]
-    worst_branch = branch_summary[-1]
-    # Compose friendly, clear HTML
-    html = f'''
-    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 900px; margin: auto;">
-      <div class="alert alert-info text-center" style="font-size:1.3rem;font-weight:bold;">Executive Forecast Insights</div>
-      <ul style="font-size:1.08rem;line-height:1.7;">
-        <li><b>Total forecasted sales (full period):</b> <span style="color:#007bff">{forecast_df['yhat'].sum():,.2f} units</span></li>
-        <li><b>Average monthly forecasted sales:</b> <span style="color:#007bff">{forecast_df['yhat'].mean():,.2f} units</span></li>
-        <li><b>Best performing branch:</b> <span style="color:#28a745">{best_branch['Branch']}</span> (Regional Manager: <b>{best_branch['RegionalManager']}</b>, Sales Head: <b>{best_branch['SalesHead']}</b>) with <b>{best_branch['TotalSales']:,.2f} units</b> in sales.</li>
-        <li><b>Lowest performing branch:</b> <span style="color:#dc3545">{worst_branch['Branch']}</span> (Regional Manager: <b>{worst_branch['RegionalManager']}</b>, Sales Head: <b>{worst_branch['SalesHead']}</b>) with <b>{worst_branch['TotalSales']:,.2f} units</b> in sales.</li>
-      </ul>
-      <div style="font-size:1.08rem;">
-        <b>Suggestions for Improvement:</b>
-        <ul style="margin-bottom:0.5rem;">
-          <li>Encourage <b>{worst_branch['RegionalManager']}</b> and <b>{worst_branch['SalesHead']}</b> to review successful strategies from <b>{best_branch['Branch']}</b> and adapt them locally.</li>
-          <li>Consider targeted training, marketing campaigns, and customer engagement in <b>{worst_branch['Branch']}</b> to boost performance.</li>
-          <li>Foster collaboration between branch heads to share best practices and address unique challenges.</li>
-          <li>Monitor progress monthly and celebrate improvements to motivate teams.</li>
-        </ul>
-      </div>
-      <div style="margin:1.2rem 0 0.7rem 0;">
-        <b>Month-End Forecast Table (Next 8 Months):</b>
-        <div class="table-responsive" style="font-size:1.05rem;">{month_end_html}</div>
-      </div>
-    </div>
-    '''
+    best_branch = branch_summary[0] if branch_summary else {'Branch': '', 'RegionalManager': '', 'SalesHead': '', 'TotalSales': 0}
+    worst_branch = branch_summary[-1] if branch_summary else {'Branch': '', 'RegionalManager': '', 'SalesHead': '', 'TotalSales': 0}
+    prompt = (
+        "You are an executive sales analyst. "
+        "Given the following forecast summary and table, provide a clear, actionable, executive-level insight. "
+        "Focus on improvement opportunities, strengths, and risks. "
+        "Here is the summary:\n"
+        f"Total forecasted sales: {forecast_df['yhat'].sum():,.2f} units. "
+        f"Average monthly forecast: {forecast_df['yhat'].mean():,.2f} units. "
+        f"Best branch: {best_branch['Branch']} (Manager: {best_branch['RegionalManager']}, Head: {best_branch['SalesHead']}) with {best_branch['TotalSales']:,.2f} units. "
+        f"Worst branch: {worst_branch['Branch']} (Manager: {worst_branch['RegionalManager']}, Head: {worst_branch['SalesHead']}) with {worst_branch['TotalSales']:,.2f} units. "
+        "Month-end forecast table:\n"
+        f"{month_end_table.to_string(index=False)}"
+    )
+    # Run the agentic GenAI insight generator
+    try:
+        genai_html = asyncio.run(get_genai_insights_agentic(prompt))
+    except Exception as e:
+        genai_html = f"<div class='alert alert-danger'>GenAI agentic service error: {str(e)}</div>"
+    html = f"""
+    <div class='alert alert-secondary'><b>GenAI Prompt (editable in code):</b><br><pre style='white-space:pre-wrap;font-size:1rem;background:#f8f9fa;border:1px solid #ccc;padding:0.5em'>{prompt}</pre></div>
+    <div>{genai_html}</div>
+    """
     return HTMLResponse(html)
 
 @app.get("/api/manager-head", response_class=JSONResponse)
