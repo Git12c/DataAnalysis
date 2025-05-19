@@ -13,6 +13,8 @@ from prophet import Prophet
 from data_loader import load_and_merge_data
 from preprocessing import preprocess_for_prophet
 from prophet_model import train_and_forecast, save_prophet_plots
+from dotenv import load_dotenv
+import requests
 
 app = FastAPI()
 
@@ -180,3 +182,62 @@ def update_selection(request: Request, product_id: int = Form(...), branch: str 
         "upload_message": message,
         "show_selection_form": True
     })
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+AUTOGEN_API_KEY = os.getenv("AUTOGEN_API_KEY")
+
+# Helper to call Gemini 1.5 Flash for GenAI insights
+def get_genai_insights(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return "<div class='alert alert-warning'>GEMINI_API_KEY not set in .env</div>"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + GEMINI_API_KEY
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 512}
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=data, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        # Extract HTML from the response
+        html = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        return html
+    except Exception as e:
+        return f"<div class='alert alert-danger'>GenAI error: {str(e)}</div>"
+
+@app.get("/genai/insights", response_class=HTMLResponse)
+def genai_insights(request: Request):
+    global forecast_df
+    if forecast_df is None or forecast_df.empty:
+        return HTMLResponse("<div class='alert alert-warning'>No forecast available for insights.</div>")
+    # Prepare prompt for GenAI
+    forecast_df['ds'] = pd.to_datetime(forecast_df['ds'])
+    month_end = forecast_df.groupby([forecast_df['ds'].dt.to_period('M')]).tail(1)
+    month_end_sales = month_end[['ds', 'yhat']].to_dict(orient='records')
+    last_7 = forecast_df.sort_values('ds').tail(7)[['ds', 'yhat']].to_dict(orient='records')
+    prompt = (
+        "You are a business analyst. Given the following forecasted sales data, "
+        "provide a concise HTML summary with insights for month-end sales and day-to-day sales trends. "
+        "Highlight any spikes, drops, or patterns.\n"
+        f"Month-end sales: {month_end_sales}\n"
+        f"Last 7 days sales: {last_7}\n"
+        "Also, suggest actionable strategies to improve sales and reach a hypothetical target of 20% higher sales next month. "
+        "Return only HTML code for use in Power BI."
+    )
+    # Temporary GenAI output for testing/demo
+    temp_html = '''
+    <div class="alert alert-info"><b>GenAI Insights (Demo):</b><br>
+    <ul>
+      <li><b>Month-end sales</b> show a steady upward trend, with a notable spike in the last month.</li>
+      <li><b>Day-to-day sales</b> in the last week indicate increased volatility, with two days exceeding the weekly average by 30%.</li>
+      <li><b>Recommendation:</b> To reach a 20% higher sales target next month, consider targeted promotions during mid-week, optimize inventory for high-demand days, and launch a customer loyalty program.</li>
+    </ul>
+    </div>
+    '''
+    # Uncomment below to use real GenAI output
+    # html = get_genai_insights(prompt)
+    # return HTMLResponse(html)
+    return HTMLResponse(temp_html)
