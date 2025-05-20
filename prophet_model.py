@@ -4,9 +4,16 @@ import pandas as pd
 
 def train_and_forecast(df, periods=90):
     model = Prophet()
-    model.fit(df)
+    model.fit(df[['ds', 'y']])
     future = model.make_future_dataframe(periods=periods, freq='D')
     forecast = model.predict(future)
+    # Attach extra columns for downstream use (use last known values for future rows)
+    for col in ['Product', 'Region', 'SalesOffice', 'Sales Head', 'Regional Manager', 'ProductID', 'Ship Branch']:
+        if col in df.columns:
+            last_val = df[col].iloc[-1] if not df[col].empty else None
+            forecast[col] = last_val
+        else:
+            forecast[col] = None
     return model, forecast
 
 def save_prophet_plots(model, forecast, static_dir='static'):
