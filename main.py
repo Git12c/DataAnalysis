@@ -17,7 +17,7 @@ from preprocessing import preprocess_for_prophet
 from prophet_model import train_and_forecast, save_prophet_plots
 from dotenv import load_dotenv
 import requests
-from agentic_genai import run_sales_insight_agent
+from agentic_genai import get_gemini_insight
 import asyncio
 
 app = FastAPI()
@@ -96,16 +96,42 @@ def api_prophet_forecast():
 
 @app.get("/prophet/plot", response_class=HTMLResponse)
 def prophet_plot(request: Request):
+    import os
+    import google.generativeai as genai
+    from PIL import Image
     global prophet_model, forecast_df
     if prophet_model is None or forecast_df is None:
         return HTMLResponse("<div class='alert alert-warning'>No forecast available.</div>")
+    # Generate and save the plot image
+    plot_path = "prophet_forecast.png"
     fig = prophet_model.plot(forecast_df)
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png')
-    buf.seek(0)
-    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-    img_src = f"data:image/png;base64,{img_base64}"
-    return templates.TemplateResponse("plain.html", {"request": request, "img_src": img_src})
+    fig.savefig(plot_path, format='png')
+    # Use Gemini to generate insights from the plot image
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    try:
+        img = Image.open(plot_path)
+    except FileNotFoundError:
+        return HTMLResponse(f"<div class='alert alert-danger'>Error: The file {plot_path} was not found.</div>")
+    try:
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+        response = model.generate_content(
+            contents=[img, (
+                "You are a business executive sales analyst. "
+                "Analyze this sales forecast plot and provide structured, executive-level business insights in HTML. "
+                "Focus only on future prospects, sales trends, growth or decline, and actionable recommendations for business strategy. "
+                "Use only sales numbers and percentages that are clearly present in the data. "
+                "Never mention technical or modeling details, N/A, 0%, missing/zero/uncertain/unavailable values, or anything you cannot see in the data. "
+                "Do not discuss how to improve the model or data. "
+                "Never mention the years explicitly or use hardcoded year values. "
+                "Never mention the image or the process of analysis. "
+                "Use bold for key numbers, bullet points for recommendations, and clear sections. "
+                "Do not show the image, only the insights."
+            )]
+        )
+        insights_html = response.text
+    except Exception as e:
+        return HTMLResponse(f"<div class='alert alert-danger'>An error occurred during content generation: {e}</div>")
+    return HTMLResponse(insights_html)
 
 @app.get("/prophet/components", response_class=HTMLResponse)
 def prophet_components(request: Request):
@@ -224,150 +250,174 @@ def get_manager_or_head(subdf, colname, global_mode=None):
 
 @app.get("/train/all", response_class=HTMLResponse)
 def train_all_report(request: Request):
-    import pandas as pd
+    import os
+    import google.generativeai as genai
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    import time
     df = dataframes['main']
-    if df.empty:
-        return HTMLResponse("<div class='alert alert-warning'>No data available for consolidated training.</div>")
-    results = []
+    # Generate and save images for all product/branch pairs into static directory
+    static_dir = os.path.join(os.getcwd(), 'static')
+    os.makedirs(static_dir, exist_ok=True)
+    image_paths = []
     product_ids = sorted(df['ProductID'].unique())
     branches = sorted(df['Ship Branch'].unique())
-    # Compute global modes for fallback
-    global_mgr = get_manager_or_head(df, 'Regional Manager')
-    global_head = get_manager_or_head(df, 'Sales Head')
     for pid in product_ids:
         for branch in branches:
             subdf = df[(df['ProductID'] == pid) & (df['Ship Branch'] == branch)]
-            if len(subdf) < 10:
+            if subdf.empty:
                 continue
             prophet_data = preprocess_for_prophet(df, product_id=pid, branch=branch)
             if prophet_data.empty:
                 continue
             model, forecast = train_and_forecast(prophet_data, periods=90)
-            total_forecast = forecast['yhat'].sum()
-            avg_forecast = forecast['yhat'].mean()
-            # --- Robust manager/head extraction: always use most frequent non-null in subdf, fallback to first non-null, then global ---
-            def robust_name(subdf, col, global_mode):
-                vals = subdf[col].dropna() if col in subdf.columns else pd.Series(dtype=str)
-                if not vals.empty:
-                    mode = vals.mode()
-                    if not mode.empty and pd.notnull(mode[0]) and str(mode[0]).strip():
-                        return str(mode[0]).strip()
-                    for v in vals:
-                        if pd.notnull(v) and str(v).strip():
-                            return str(v).strip()
-                if global_mode:
-                    return global_mode
-                return ""
-            regional_manager = robust_name(subdf, 'Regional Manager', global_mgr)
-            sales_head = robust_name(subdf, 'Sales Head', global_head)
-            results.append({
-                'ProductID': pid,
-                'Branch': branch,
-                'TotalForecast': total_forecast,
-                'AvgForecast': avg_forecast,
-                'RegionalManager': regional_manager,
-                'SalesHead': sales_head
-            })
-    if not results:
-        return HTMLResponse("<div class='alert alert-warning'>No sufficient data for consolidated report.</div>")
-    results_df = pd.DataFrame(results)
-    # Pivot table with units in column heading and full border
-    pivot = results_df.pivot(index='ProductID', columns='Branch', values='TotalForecast').fillna(0)
-    pivot.columns = [f"{col} (units)" for col in pivot.columns]
-    pivot_html = pivot.to_html(classes='table table-bordered table-sm', border=2, justify='center')
-    # Overall summary
-    overall_total = results_df['TotalForecast'].sum()
-    overall_avg = results_df['AvgForecast'].mean()
-    # Only consider rows with manager and head names for best/worst
-    valid_results = results_df[(results_df['RegionalManager'] != '') & (results_df['SalesHead'] != '')]
-    if not valid_results.empty:
-        best_row = valid_results.loc[valid_results['TotalForecast'].idxmax()]
-        worst_row = valid_results.loc[valid_results['TotalForecast'].idxmin()]
-    else:
-        best_row = results_df.loc[results_df['TotalForecast'].idxmax()]
-        worst_row = results_df.loc[results_df['TotalForecast'].idxmin()]
-    improvement_needed = best_row['TotalForecast'] - worst_row['TotalForecast']
-    improvement_pct = (improvement_needed / best_row['TotalForecast']) * 100 if best_row['TotalForecast'] else 0
-    insight = f"""
-    <b>Overall Insight:</b> The total forecasted sales across all products and branches is <b>{overall_total:,.2f} units</b>.<br>
-    The average forecast per product-branch pair is <b>{overall_avg:,.2f} units</b>.<br>
-    <b>Best performing:</b> ProductID <b>{best_row['ProductID']}</b> in <b>{best_row['Branch']}</b>{f" (Regional Manager: <b>{best_row['RegionalManager']}</b>, Sales Head: <b>{best_row['SalesHead']}</b>)" if best_row['RegionalManager'] or best_row['SalesHead'] else ''} with <b>{best_row['TotalForecast']:,.2f} units</b>.<br>
-    <b>Lowest performing:</b> ProductID <b>{worst_row['ProductID']}</b> in <b>{worst_row['Branch']}</b>{f" (Regional Manager: <b>{worst_row['RegionalManager']}</b>, Sales Head: <b>{worst_row['SalesHead']}</b>)" if worst_row['RegionalManager'] or worst_row['SalesHead'] else ''} with <b>{worst_row['TotalForecast']:,.2f} units</b>.<br>
-    <b>Improvement Opportunity:</b> To bring the lowest performing cell up to the best, an increase of <b>{improvement_needed:,.2f} units</b> ({improvement_pct:.1f}%) is needed.<br>
-    <b>Actionable Recommendation:</b> Focus on <b>{worst_row['Branch']}</b>{f" (Regional Manager: <b>{worst_row['RegionalManager']}</b>, Sales Head: <b>{worst_row['SalesHead']}</b>)" if worst_row['RegionalManager'] or worst_row['SalesHead'] else ''} for targeted training, marketing, and resource allocation. Analyze local challenges, customer feedback, and sales process bottlenecks. Consider incentive programs and best-practice sharing from top-performing branches.<br>
-    <b>Additional Insights:</b> If the bottom 25% of branches/products are improved by just 10%, overall sales could increase by <b>{(results_df.nsmallest(max(1, len(results_df)//4), 'TotalForecast')['TotalForecast'].sum() * 0.1):,.2f} units</b>.<br>
-    """
-    html = f'''
-    <div class="alert alert-info"><b>Consolidated Forecast Report (All Products & Branches)</b></div>
-    <b>Pivot Table (Total Forecasted Sales):</b>
-    <div class="table-responsive">{pivot_html}</div>
-    <div class="alert alert-success">{insight}</div>
-    '''
-    return HTMLResponse(html)
+            fig = model.plot(forecast)
+            img_path = os.path.join(static_dir, f"prophet_forecast_{pid}_{branch}.png")
+            fig.savefig(img_path, format='png')
+            plt.close(fig)
+            image_paths.append((img_path, pid, branch))
+    if not image_paths:
+        return HTMLResponse("<div class='alert alert-warning'>No forecast images available for consolidated insights.</div>")
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    insights_html = ""
+    for img_path, pid, branch in image_paths:
+        # Wait for the file to be available (max 10s)
+        waited = 0
+        while not os.path.exists(img_path) and waited < 10:
+            time.sleep(0.5)
+            waited += 0.5
+        if not os.path.exists(img_path):
+            insights_html += f"<div class='alert alert-danger'>Image for ProductID {pid} Branch {branch} could not be found after waiting.</div>"
+            continue
+        try:
+            img = Image.open(img_path)
+        except Exception as e:
+            insights_html += f"<div class='alert alert-danger'>Error opening image for ProductID {pid} Branch {branch}: {e}</div>"
+            continue
+        try:
+            model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+            response = model.generate_content(
+                contents=[img, (
+                    f"You are a professional sales executive. Analyze this sales forecast plot for ProductID {pid} and Branch {branch} and provide a structured, executive-level business insight in HTML. "
+                    "Focus only on future prospects, sales trends, growth or decline, and actionable recommendations for business strategy. "
+                    "Use only sales numbers and percentages that are clearly present in the data. "
+                    "Never mention technical or modeling details, N/A, 0%, missing/zero/uncertain/unavailable values, or anything you cannot see in the data. "
+                    "Do not discuss how to improve the model or data. "
+                    "Never mention the years explicitly or use hardcoded year values. "
+                    "Never mention the image or the process of analysis. "
+                    "Use bold for key numbers, bullet points for recommendations, and clear sections. "
+                    "Do not show the image, only the insights."
+                )]
+            )
+            insights_html += f"<div style='margin-bottom:2em'><h4>ProductID {pid} - Branch {branch}</h4>" + response.text + "</div>"
+        except Exception as e:
+            insights_html += f"<div class='alert alert-danger'>An error occurred for ProductID {pid} Branch {branch}: {e}</div>"
+    if not insights_html:
+        return HTMLResponse("<div class='alert alert-danger'>No insights could be generated from the forecast images.</div>")
+    return HTMLResponse(insights_html)
 
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-AUTOGEN_API_KEY = os.getenv("AUTOGEN_API_KEY")
-
-# Helper to call Gemini 1.5 Flash for GenAI insights using agentic approach
-async def get_genai_insights_agentic(prompt: str) -> str:
-    return await run_sales_insight_agent(prompt)
 
 @app.get("/genai/insights", response_class=HTMLResponse)
 def genai_insights(request: Request):
-    import pandas as pd
-    global forecast_df
-    if forecast_df is None or forecast_df.empty:
-        return HTMLResponse("<div class='alert alert-warning'>No forecast available for insights.</div>")
-    forecast_df['ds'] = pd.to_datetime(forecast_df['ds'])
-    forecast_df['month'] = forecast_df['ds'].dt.to_period('M')
-    next_8_months = forecast_df[forecast_df['ds'] > pd.Timestamp.today()].groupby('month').tail(1).head(8)
-    month_end_table = next_8_months[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
-    month_end_table['ds'] = month_end_table['ds'].dt.strftime('%B %Y')
-    month_end_table = month_end_table.rename(columns={
-        'ds': 'Month End', 'yhat': 'Forecast (Sales)', 'yhat_lower': 'Lower Bound (Sales)', 'yhat_upper': 'Upper Bound (Sales)'
-    })
-    month_end_table = month_end_table[['Month End', 'Forecast (Sales)', 'Lower Bound (Sales)', 'Upper Bound (Sales)']]
-    month_end_html = month_end_table.to_html(index=False, classes='table table-bordered table-sm text-center align-middle', border=0, justify='center')
-    # Executive summary with branch/manager/head details
-    df = dataframes['main']
-    # Compute global modes for fallback
-    global_mgr = get_manager_or_head(df, 'Regional Manager')
-    global_head = get_manager_or_head(df, 'Sales Head')
-    branch_summary = []
-    for branch in df['Ship Branch'].unique():
-        branch_df = df[df['Ship Branch'] == branch]
-        total_sales = branch_df['Ext Total Sales'].sum()
-        regional_manager = get_manager_or_head(branch_df, 'Regional Manager', global_mgr)
-        sales_head = get_manager_or_head(branch_df, 'Sales Head', global_head)
-        branch_summary.append({'Branch': branch, 'TotalSales': total_sales, 'RegionalManager': regional_manager, 'SalesHead': sales_head})
-    branch_summary = [b for b in branch_summary if b['RegionalManager'] and b['SalesHead']]
-    branch_summary = sorted(branch_summary, key=lambda x: x['TotalSales'], reverse=True)
-    best_branch = branch_summary[0] if branch_summary else {'Branch': '', 'RegionalManager': '', 'SalesHead': '', 'TotalSales': 0}
-    worst_branch = branch_summary[-1] if branch_summary else {'Branch': '', 'RegionalManager': '', 'SalesHead': '', 'TotalSales': 0}
-    prompt = (
-        "You are an executive sales analyst. "
-        "Given the following forecast summary and table, provide a clear, actionable, executive-level insight. "
-        "Focus on improvement opportunities, strengths, and risks. "
-        "Here is the summary:\n"
-        f"Total forecasted sales: {forecast_df['yhat'].sum():,.2f} units. "
-        f"Average monthly forecast: {forecast_df['yhat'].mean():,.2f} units. "
-        f"Best branch: {best_branch['Branch']} (Manager: {best_branch['RegionalManager']}, Head: {best_branch['SalesHead']}) with {best_branch['TotalSales']:,.2f} units. "
-        f"Worst branch: {worst_branch['Branch']} (Manager: {worst_branch['RegionalManager']}, Head: {worst_branch['SalesHead']}) with {worst_branch['TotalSales']:,.2f} units. "
-        "Month-end forecast table:\n"
-        f"{month_end_table.to_string(index=False)}"
-    )
-    # Run the agentic GenAI insight generator
+    import os
+    import google.generativeai as genai
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    global prophet_model, forecast_df
+    # Ensure the plot image exists by generating it if needed
+    plot_path = "prophet_forecast.png"
+    if prophet_model is not None and forecast_df is not None:
+        fig = prophet_model.plot(forecast_df)
+        fig.savefig(plot_path, format='png')
+        plt.close(fig)
     try:
-        genai_html = asyncio.run(get_genai_insights_agentic(prompt))
+        img = Image.open(plot_path)
+    except FileNotFoundError:
+        return HTMLResponse(f"<div class='alert alert-danger'>Error: The file {plot_path} was not found and could not be generated.</div>")
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    try:
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+        response = model.generate_content(
+            contents=[img, (
+                "You are a business executive sales analyst. "
+                "Analyze this sales forecast plot and provide structured, executive-level business insights in HTML. "
+                "Focus only on future prospects, sales trends, growth or decline, and actionable recommendations for business strategy. "
+                "Use only sales numbers and percentages that are clearly present in the data. "
+                "Never mention technical or modeling details, N/A, 0%, missing/zero/uncertain/unavailable values, or anything you cannot see in the data. "
+                "Do not discuss how to improve the model or data. "
+                "Never mention the years explicitly or use hardcoded year values. "
+                "Never mention the image or the process of analysis. "
+                "Use bold for key numbers, bullet points for recommendations, and clear sections. "
+                "Do not show the image, only the insights."
+            )]
+        )
+        insights_html = response.text
     except Exception as e:
-        genai_html = f"<div class='alert alert-danger'>GenAI agentic service error: {str(e)}</div>"
-    html = f"""
-    <div class='alert alert-secondary'><b>GenAI Prompt (editable in code):</b><br><pre style='white-space:pre-wrap;font-size:1rem;background:#f8f9fa;border:1px solid #ccc;padding:0.5em'>{prompt}</pre></div>
-    <div>{genai_html}</div>
-    """
-    return HTMLResponse(html)
+        return HTMLResponse(f"<div class='alert alert-danger'>An error occurred during content generation: {e}</div>")
+    return HTMLResponse(insights_html)
+
+@app.get("/genai/consolidated-insights", response_class=HTMLResponse)
+def genai_consolidated_insights(request: Request):
+    import os
+    import google.generativeai as genai
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    global prophet_model, forecast_df
+    df = dataframes['main']
+    # Generate and save multiple images for consolidated insights
+    image_paths = []
+    product_ids = sorted(df['ProductID'].unique())
+    branches = sorted(df['Ship Branch'].unique())
+    for pid in product_ids:
+        for branch in branches:
+            subdf = df[(df['ProductID'] == pid) & (df['Ship Branch'] == branch)]
+            if subdf.empty:
+                continue
+            prophet_data = preprocess_for_prophet(df, product_id=pid, branch=branch)
+            if prophet_data.empty:
+                continue
+            model, forecast = train_and_forecast(prophet_data, periods=90)
+            fig = model.plot(forecast)
+            img_path = f"prophet_forecast_{pid}_{branch}.png"
+            fig.savefig(img_path, format='png')
+            plt.close(fig)
+            image_paths.append(img_path)
+    if not image_paths:
+        return HTMLResponse("<div class='alert alert-warning'>No forecast images available for consolidated insights.</div>")
+    imgs = []
+    for img_path in image_paths:
+        try:
+            imgs.append(Image.open(img_path))
+        except FileNotFoundError:
+            continue
+    if not imgs:
+        return HTMLResponse("<div class='alert alert-danger'>No forecast images could be loaded for insights.</div>")
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    try:
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+        response = model.generate_content(
+            contents=imgs + [
+                (
+                    "You are a professional sales executive. "
+                    "Analyze these sales forecast plots and provide a consolidated, structured, executive-level business insight in HTML. "
+                    "Focus only on future prospects, sales trends, growth or decline, and actionable recommendations for business strategy. "
+                    "Use only sales numbers and percentages that are clearly present in the data. "
+                    "Never mention technical or modeling details, N/A, 0%, missing/zero/uncertain/unavailable values, or anything you cannot see in the data. "
+                    "Do not discuss how to improve the model or data. "
+                    "Never mention the years explicitly or use hardcoded year values. "
+                    "Never mention the images or the process of analysis. "
+                    "Use bold for key numbers, bullet points for recommendations, and clear sections. "
+                    "Do not show the images, only the insights."
+                )
+            ]
+        )
+        insights_html = response.text
+    except Exception as e:
+        return HTMLResponse(f"<div class='alert alert-danger'>An error occurred during content generation: {e}</div>")
+    return HTMLResponse(insights_html)
 
 @app.get("/api/manager-head", response_class=JSONResponse)
 def get_manager_head(product_id: int, branch: str):
@@ -390,57 +440,3 @@ def get_manager_head(product_id: int, branch: str):
         'RegionalManager': regional_manager,
         'SalesHead': sales_head
     })
-
-@app.get("/genai/consolidated-insights", response_class=HTMLResponse)
-def genai_consolidated_insights(request: Request):
-    import pandas as pd
-    df = dataframes['main']
-    if df.empty:
-        return HTMLResponse("<div class='alert alert-warning'>No data available for insights.</div>")
-    product_ids = sorted(df['ProductID'].unique())
-    branches = sorted(df['Ship Branch'].unique())
-    summary_rows = []
-    for pid in product_ids:
-        for branch in branches:
-            subdf = df[(df['ProductID'] == pid) & (df['Ship Branch'] == branch)]
-            if subdf.empty:
-                continue
-            # Use the new robust endpoint logic directly
-            def robust_name(subdf, col):
-                vals = subdf[col].dropna() if col in subdf.columns else pd.Series(dtype=str)
-                if not vals.empty:
-                    mode = vals.mode()
-                    if not mode.empty and pd.notnull(mode[0]) and str(mode[0]).strip():
-                        return str(mode[0]).strip()
-                    for v in vals:
-                        if pd.notnull(v) and str(v).strip():
-                            return str(v).strip()
-                return ""
-            regional_manager = robust_name(subdf, 'Regional Manager')
-            sales_head = robust_name(subdf, 'Sales Head')
-            total_sales = subdf['Ext Total Sales'].sum()
-            summary_rows.append({
-                'ProductID': pid,
-                'Branch': branch,
-                'RegionalManager': regional_manager,
-                'SalesHead': sales_head,
-                'TotalSales': total_sales
-            })
-    if not summary_rows:
-        return HTMLResponse("<div class='alert alert-warning'>No data available for consolidated insights.</div>")
-    summary_df = pd.DataFrame(summary_rows)
-    # Pivot for display
-    pivot = summary_df.pivot(index='ProductID', columns='Branch', values='TotalSales').fillna(0)
-    pivot_html = pivot.to_html(classes='table table-bordered table-sm', border=0, justify='center')
-    # Executive summary
-    html = f'''
-    <div class="alert alert-info"><b>Consolidated GenAI Executive Insights (All Products & Branches)</b></div>
-    <b>Pivot Table (Total Sales):</b>
-    <div class="table-responsive">{pivot_html}</div>
-    <div class="alert alert-success">
-    <ul>
-    '''
-    for row in summary_rows:
-        html += f'<li>ProductID <b>{row["ProductID"]}</b> in <b>{row["Branch"]}</b>: Regional Manager: <b>{row["RegionalManager"]}</b>, Sales Head: <b>{row["SalesHead"]}</b>, Total Sales: <b>{row["TotalSales"]:,.2f}</b></li>'
-    html += '</ul></div>'
-    return HTMLResponse(html)
