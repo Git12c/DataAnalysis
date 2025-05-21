@@ -35,6 +35,11 @@ app.add_middleware(
 dataframes = {}
 
 dataframes['main'] = load_and_merge_data()
+# Ensure required columns exist to prevent KeyError
+if 'ProductID' not in dataframes['main'].columns:
+    dataframes['main']['Product'] = ''
+if 'Ship Branch' not in dataframes['main'].columns:
+    dataframes['main']['Ship Branch'] = ''
 
 # Prophet model and forecast cache
 prophet_model = None
@@ -323,64 +328,51 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 @app.get("/genai/insights", response_class=HTMLResponse)
 def genai_insights(request: Request):
-    import os
-    import pandas as pd
-    forecast6_dir = os.path.join(os.getcwd(), 'forecast6')
-    summary_csv = os.path.join(forecast6_dir, "forecast_6y_summary.csv")
-    # Get current selection
+    import google.generativeai as genai
     selected_pid = user_selection.get('product_id')
     selected_branch = user_selection.get('branch')
     selected_product = productid_to_name.get(selected_pid, str(selected_pid))
-    # Try to generate summary table if missing
-    if not os.path.exists(summary_csv):
-        try:
-            _ = api_prophet_forecast_6y()
-        except Exception:
-            pass
-    if not os.path.exists(summary_csv):
-        # Fallback: use /data-table (main data) to generate a minimal insight for selected product/branch
-        df = dataframes['main']
-        if df.empty:
-            return HTMLResponse("<div class='alert alert-danger'>No data available to generate insights.</div>")
-        group_cols = ['Product', 'Ship Branch', 'Region', 'SalesOffice', 'Regional Manager', 'Sales Head']
-        for col in group_cols:
-            if col not in df.columns:
-                df[col] = ''
-        filtered = df[(df['ProductID'] == selected_pid) & (df['Ship Branch'] == selected_branch)]
-        if filtered.empty:
-            return HTMLResponse(f"<div class='alert alert-warning'>No data for selected product and branch.</div>")
-        summary = filtered.groupby(group_cols)['Price'].sum().reset_index().rename(columns={'Ship Branch': 'Branch', 'Price': 'TotalSales'})
-        total_sales = summary['TotalSales'].sum()
-        summary['PercentOfTotal'] = summary['TotalSales'] / total_sales * 100 if total_sales else 0
-        summary = summary.sort_values('TotalSales')
-        html = f"""
-        <h3>Executive Summary: Sales Insights for {selected_product} ({selected_branch})</h3>
-        <ul>"""
-        for _, row in summary.iterrows():
-            html += f"<li>Product: <b>{row['Product']}</b> in <b>{row['Region']}</b> region (Branch: <b>{row['Branch']}</b>, Sales Office: <b>{row['SalesOffice']}</b>) has sales: <b>{row['TotalSales']:,.0f}</b> (<b>{row['PercentOfTotal']:.2f}%</b> of this product/branch). Responsible: Regional Manager: <b>{row['Regional Manager']}</b>, Sales Head: <b>{row['Sales Head']}</b>.</li>"
-        html += "</ul>"
-        html += "<b>Recommendation:</b> Focus on improving sales for the above region/office combinations. Regional Managers and Sales Heads should review sales strategies and marketing efforts."
-        return HTMLResponse(html)
-    # Normal path: summary table exists
-    summary_df = pd.read_csv(summary_csv)
-    # Filter for selected product and branch
-    filtered = summary_df[(summary_df['ProductID'] == selected_pid) & (summary_df['Branch'] == selected_branch)]
-    if filtered.empty:
-        return HTMLResponse(f"<div class='alert alert-warning'>No forecast summary for selected product and branch.</div>")
-    lagging = []
-    for _, row in filtered.iterrows():
-        if pd.notnull(row['Difference']) and row['Difference'] < 0:
-            lagging.append((row['Product'], row['Branch'], abs(row['Difference']), abs(row['PercentDiff']),
-                            row['Regional Manager'], row['Sales Head'], row['Region'], row['SalesOffice']))
-    html = f"""
-    <h3>Executive Summary: Sales Shortfall Insights for {selected_product} ({selected_branch})</h3>
-    <ul>"""
-    for pname, branch, diff, pct, regional_manager, sales_head, region, sales_office in lagging:
-        html += f"<li>Product: <b>{pname}</b> in <b>{region}</b> region (Branch: <b>{branch}</b>, Sales Office: <b>{sales_office}</b>) is forecasted to be <b>{diff:,.0f}</b> below target (<b>{pct:.1f}%</b> shortfall). Responsible: Regional Manager: <b>{regional_manager}</b>, Sales Head: <b>{sales_head}</b>.</li>"
-    if not lagging:
-        html += "<li>No significant sales shortfall detected for this product and branch.</li>"
-    html += "</ul>"
-    html += "<b>Recommendations:</b> Immediate attention is required for any above region/office combinations with shortfall. Regional Managers and Sales Heads should review sales strategies, pricing, and marketing efforts to address these shortfalls."
+    # Get the future forecast for the selected product/branch
+    df = dataframes['main']
+    prophet_data = preprocess_for_prophet(df, product_id=selected_pid, branch=selected_branch)
+    if prophet_data.empty:
+        return HTMLResponse("<div class='alert alert-danger'>No data available for the selected product and branch.</div>")
+    model, forecast = train_and_forecast(prophet_data, periods=90)
+    # Group by SalesOffice, Regional Manager, Sales Head, Region, Branch, Product
+    group_cols = ['Product', 'Branch', 'Region', 'SalesOffice', 'Regional Manager', 'Sales Head']
+    # Attach extra columns if missing
+    for col in group_cols:
+        if col not in forecast.columns:
+            forecast[col] = prophet_data[col].iloc[-1] if col in prophet_data.columns and not prophet_data[col].empty else ''
+    # Use only future rows (after last date in prophet_data)
+    last_train_date = prophet_data['ds'].max()
+    future_forecast = forecast[forecast['ds'] > last_train_date]
+    summary = future_forecast.groupby(group_cols)['yhat'].sum().reset_index().rename(columns={'yhat': 'TotalSales'})
+    total_sales = summary['TotalSales'].sum()
+    summary['PercentOfTotal'] = summary['TotalSales'] / total_sales * 100 if total_sales else 0
+    summary = summary.sort_values('TotalSales')
+    # Compose executive summary in template format
+    summary_lines = []
+    for _, row in summary.iterrows():
+        summary_lines.append(
+            f"Product: <b>{row['Product']}</b> in <b>{row['Region']}</b> region (Branch: <b>{row['Branch']}</b>, Sales Office: <b>{row['SalesOffice']}</b>) has sales: <b>{row['TotalSales']:,.0f}</b> (<b>{row['PercentOfTotal']:.2f}%</b> of this product/branch). Responsible: Regional Manager: <b>{row['Regional Manager']}</b>, Sales Head: <b>{row['Sales Head']}</b>."
+        )
+    # Fix prompt construction: use only f-string and concatenation, not mixed triple-quote and +
+    prompt = (
+        f"You are a business analyst. Given the following sales forecast data for product {selected_product} in branch {selected_branch}, generate an executive summary in HTML. Use this template:\n"
+        f"<h3>Executive Summary: Sales Insights for {selected_product} ({selected_branch})</h3>\n"
+        "<ul>\n"
+        + "\n".join([f"<li>{line}</li>" for line in summary_lines]) +
+        "\n</ul>\n"
+        "<b>Recommendation:</b> Focus on improving sales for the above region/office combinations. Regional Managers and Sales Heads should review sales strategies and marketing efforts."
+    )
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    try:
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        html = response.text.replace('```html', '').replace('```', '')
+    except Exception as e:
+        html = f"<div class='alert alert-danger'>GenAI error: {e}</div>"
     return HTMLResponse(html)
 
 @app.get("/genai/consolidated-insights", response_class=HTMLResponse)
@@ -470,7 +462,7 @@ def get_manager_head(product_id: str, branch: str):
     })
 
 # Store 6-year forecasts for all product/branch pairs
-six_year_forecasts = {}
+six_year_forecasts = dict()
 
 # Hardcoded target values for each (product_id, branch) pair
 # Example: {(product_id, branch): target_value}
@@ -501,7 +493,7 @@ def api_prophet_forecast_6y():
     from preprocessing import preprocess_for_prophet
     from prophet_model import train_and_forecast
     df = dataframes['main']
-    forecasts = {}
+    forecasts = dict()
     product_ids = sorted(df['ProductID'].unique())
     branches = sorted(df['Ship Branch'].unique())
     forecast6_dir = os.path.join(os.getcwd(), 'forecast6')
@@ -528,86 +520,41 @@ def api_prophet_forecast_6y():
 
 @app.get("/train/all", response_class=HTMLResponse)
 def train_all_report(request: Request):
-    import os
-    import pandas as pd
+    import google.generativeai as genai
     df = dataframes['main']
-    if not six_year_forecasts:
-        _ = api_prophet_forecast_6y()
-    static_dir = os.path.join(os.getcwd(), 'static')
-    os.makedirs(static_dir, exist_ok=True)
-    forecast6_dir = os.path.join(os.getcwd(), 'forecast6')
-    os.makedirs(forecast6_dir, exist_ok=True)
-    productid_to_name = get_productid_to_name_mapping()
-    summary_rows = []
-    lagging = []
-    exceeding = []
-    for (pid, branch), forecast in six_year_forecasts.items():
-        forecast_csv = os.path.join(forecast6_dir, f"forecast_6y_{pid}_{branch}.csv")
-        try:
-            forecast_df = pd.read_csv(forecast_csv)
-            total_forecast = forecast_df['yhat'].sum()
-            # Get manager/head/region/salesoffice from first row (all future rows have same value)
-            regional_manager = forecast_df['Regional Manager'].iloc[0] if 'Regional Manager' in forecast_df.columns else ''
-            sales_head = forecast_df['Sales Head'].iloc[0] if 'Sales Head' in forecast_df.columns else ''
-            region = forecast_df['Region'].iloc[0] if 'Region' in forecast_df.columns else ''
-            sales_office = forecast_df['SalesOffice'].iloc[0] if 'SalesOffice' in forecast_df.columns else ''
-        except Exception:
-            total_forecast = 0
-            regional_manager = ''
-            sales_head = ''
-            region = ''
-            sales_office = ''
-        target = get_target_for_pair(pid, branch)
-        diff = None
-        pct = None
-        if target and target != 0:
-            diff = total_forecast - target
-            pct = (diff / target) * 100
-            if diff < 0:
-                lagging.append((productid_to_name.get(pid, pid), branch, abs(diff), abs(pct), regional_manager, sales_head, region, sales_office))
-            else:
-                exceeding.append((productid_to_name.get(pid, pid), branch, diff, pct, regional_manager, sales_head, region, sales_office))
-        summary_rows.append({
-            'ProductID': pid,
-            'Product': productid_to_name.get(pid, pid),
-            'Branch': branch,
-            'ForecastedSales': total_forecast,
-            'Target': target,
-            'Difference': diff,
-            'PercentDiff': pct,
-            'Regional Manager': regional_manager,
-            'Sales Head': sales_head,
-            'Region': region,
-            'SalesOffice': sales_office
-        })
-    summary_df = pd.DataFrame(summary_rows)
-    summary_csv = os.path.join(forecast6_dir, "forecast_6y_summary.csv")
-    summary_df.to_csv(summary_csv, index=False)
-    # ...existing code for insight template...
-    lagging_by_branch = {}
-    lagging_by_product = {}
-    for pname, branch, diff, pct, regional_manager, sales_head, region, sales_office in lagging:
-        lagging_by_branch.setdefault(branch, []).append((pname, diff, pct, regional_manager, sales_head, region, sales_office))
-        lagging_by_product.setdefault(pname, []).append((branch, diff, pct, regional_manager, sales_head, region, sales_office))
-    html = """
-    <h3>Lagging Areas and Recommendations</h3>
-    <b>East Branch:</b> This branch faces substantial challenges across multiple products.<ul>
-    """
-    for pname, diff, pct, regional_manager, sales_head, region, sales_office in lagging_by_branch.get('East', []):
-        html += f"<li>{pname} is forecasted to be <b>{diff:,.0f}</b> below target (<b>{pct:.1f}%</b> shortfall). Responsible: Regional Manager: <b>{regional_manager}</b>, Sales Head: <b>{sales_head}</b>, Region: <b>{region}</b>, Sales Office: <b>{sales_office}</b></li>"
-    html += "</ul>"
-    html += "<b>Software Product Line:</b> The Software product line performance by branch:<ul>"
-    for branch in ['East', 'South', 'West', 'North']:
-        for pname, diff, pct, regional_manager, sales_head, region, sales_office in lagging_by_branch.get(branch, []):
-            if pname == 'Software':
-                html += f"<li>{branch} branch is <b>{diff:,.0f}</b> below target (<b>{pct:.1f}%</b> shortfall). Responsible: Regional Manager: <b>{regional_manager}</b>, Sales Head: <b>{sales_head}</b>, Region: <b>{region}</b>, Sales Office: <b>{sales_office}</b></li>"
-    html += "</ul>"
-    html += "<b>Recommendation:</b> Re-evaluate the Software product's pricing, features, and marketing strategy, particularly in the East, South and West branches. A potential price adjustment, product enhancement, or new marketing campaign may be required to increase sales in these locations.<br>"
-    html += "<b>Support Product Line:</b> The Support product line underperforms expectations in these branches:<ul>"
-    for branch in ['East', 'South', 'West', 'North']:
-        for pname, diff, pct, regional_manager, sales_head, region, sales_office in lagging_by_branch.get(branch, []):
-            if pname == 'Support':
-                html += f"<li>{branch} branch is <b>{diff:,.0f}</b> below target (<b>{pct:.1f}%</b> shortfall). Responsible: Regional Manager: <b>{regional_manager}</b>, Sales Head: <b>{sales_head}</b>, Region: <b>{region}</b>, Sales Office: <b>{sales_office}</b></li>"
-    html += "</ul>"
-    html += "<b>Recommendation:</b> Analyze customer feedback and sales data to understand why the Support product is underperforming. Determine whether marketing or other adjustments are needed to address the shortfall."
+    # For each product/branch, get future forecast and aggregate
+    product_ids = sorted(df['ProductID'].dropna().unique())
+    branches = sorted(df['Ship Branch'].dropna().unique())
+    all_summaries = []
+    for pid in product_ids:
+        for branch in branches:
+            prophet_data = preprocess_for_prophet(df, product_id=pid, branch=branch)
+            if prophet_data.empty:
+                continue
+            model, forecast = train_and_forecast(prophet_data, periods=90)
+            group_cols = ['Product', 'Branch', 'Region', 'SalesOffice', 'Regional Manager', 'Sales Head']
+            for col in group_cols:
+                if col not in forecast.columns:
+                    forecast[col] = prophet_data[col].iloc[-1] if col in prophet_data.columns and not prophet_data[col].empty else ''
+            last_train_date = prophet_data['ds'].max()
+            future_forecast = forecast[forecast['ds'] > last_train_date]
+            summary = future_forecast.groupby(group_cols)['yhat'].sum().reset_index().rename(columns={'yhat': 'TotalSales'})
+            total_sales = summary['TotalSales'].sum()
+            summary['PercentOfTotal'] = summary['TotalSales'] / total_sales * 100 if total_sales else 0
+            summary = summary.sort_values('TotalSales')
+            summary_lines = []
+            for _, row in summary.iterrows():
+                summary_lines.append(
+                    f"Product: <b>{row['Product']}</b> in <b>{row['Region']}</b> region (Branch: <b>{row['Branch']}</b>, Sales Office: <b>{row['SalesOffice']}</b>) has sales: <b>{row['TotalSales']:,.0f}</b> (<b>{row['PercentOfTotal']:.2f}%</b> of this product/branch). Responsible: Regional Manager: <b>{row['Regional Manager']}</b>, Sales Head: <b>{row['Sales Head']}</b>."
+                )
+            if summary_lines:
+                all_summaries.append(f"<h3>Executive Summary: Sales Insights for {productid_to_name.get(pid, str(pid))} ({branch})</h3><ul>" + "\n".join([f"<li>{line}</li>" for line in summary_lines]) + "</ul>")
+    prompt = "You are a business analyst. Given the following sales forecast summaries for all product/branch pairs, generate a consolidated executive summary in HTML. Use the same template as above.\n" + "\n".join(all_summaries) + "\n<b>Recommendation:</b> Focus on improving sales for the above region/office combinations. Regional Managers and Sales Heads should review sales strategies and marketing efforts."
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    try:
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        html = response.text.replace('```html', '').replace('```', '')
+    except Exception as e:
+        html = f"<div class='alert alert-danger'>GenAI error: {e}</div>"
     return HTMLResponse(html)
