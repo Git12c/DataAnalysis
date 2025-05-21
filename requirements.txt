@@ -5,3 +5,4 @@ matplotlib
 prophet
 jinja2
 aiofiles
+openai
